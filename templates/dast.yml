@@ -1,0 +1,24 @@
+# ============================================================================
+# Devora DAST — caller workflow (optional, for projects with a staging URL)
+#
+# HOW TO INSTALL:
+#   1. Copy this file to:  .github/workflows/dast.yml
+#   2. Replace the target_url with the project's staging environment.
+# Runs weekly. Passive scan only — safe for staging.
+# ============================================================================
+name: DAST (staging)
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # Mondays 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  zap:
+    uses: devora2025/devora-security-ci/.github/workflows/zap-baseline.yml@main
+    with:
+      target_url: "https://staging.example.com"   # <-- change me
+      fail_on_findings: false

@@ -1,0 +1,40 @@
+name: "Devora OWASP Mobile scanners"
+description: >-
+  Runs the four Devora OWASP Mobile Top 10 scanners (M1 hardcoded secrets,
+  M2 dependencies, M5 network security, M9 insecure storage) against a Flutter
+  project and writes a uniform gate-status file plus the raw JSON reports.
+inputs:
+  project-path:
+    description: "Path to the Flutter project (the folder containing pubspec.yaml)"
+    required: false
+    default: "."
+  output-dir:
+    description: "Directory to write status + raw reports into"
+    required: false
+    default: "secscan"
+runs:
+  using: "composite"
+  steps:
+    - name: Ensure PyYAML is available
+      shell: bash
+      run: |
+        python3 -c "import yaml" 2>/dev/null \
+          || pip3 install --quiet pyyaml --break-system-packages 2>/dev/null \
+          || pip3 install --quiet pyyaml
+
+    - name: Run OWASP M1/M2/M5/M9 scanners
+      shell: bash
+      env:
+        # via env, not inline ${{ }} — path values can derive from PR contents
+        PROJECT_PATH: ${{ inputs.project-path }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+      run: |
+        set +e
+        for s in scan_hardcoded_secrets check_dependencies check_network_security analyze_storage_security; do
+          echo "::group::$s"
+          python3 "${{ github.action_path }}/scripts/$s.py" "$PROJECT_PATH"
+          echo "(scanner exit code: $?)"
+          echo "::endgroup::"
+        done
+        python3 "${{ github.action_path }}/scripts/parse_owasp_reports.py" \
+          "$PROJECT_PATH" "$OUTPUT_DIR"

@@ -1,0 +1,5 @@
+# Copy into a PROJECT repo root as `.trivyignore` only for accepted risks.
+# One CVE ID per line. ALWAYS add: reason + owner + review date.
+# Trivy picks this file up automatically from the repo root.
+
+# CVE-2024-XXXXX   # <package>: not exploitable in our usage because ... (Ali, review 2026-10)

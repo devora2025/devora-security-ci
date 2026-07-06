@@ -1,0 +1,16 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Keeps action SHA pins and the semgrep container digest fresh. The gitleaks binary is deliberately NOT managed here — its version and sha256 checksum in security-scan.yml must be bumped together, manually, on monthly patch day.",
+  "extends": [
+    "config:best-practices",
+    "schedule:weekly"
+  ],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions",
+      "pinDigests": true
+    }
+  ]
+}

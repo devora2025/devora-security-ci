@@ -1,0 +1,10 @@
+# Copy into a PROJECT repo root as `.semgrepignore` to exclude PATHS from SAST.
+# (To silence a single finding in code, prefer an inline comment on that line:
+#   // nosemgrep: <rule-id>  -- with a short justification next to it.)
+# Semgrep picks this file up automatically from the repo root.
+
+# Default-style exclusions:
+build/
+.dart_tool/
+node_modules/
+vendor/

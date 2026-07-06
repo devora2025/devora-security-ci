@@ -1,0 +1,24 @@
+# Copy this file into a PROJECT repo root as `.gitleaks.toml` ONLY when that
+# project has confirmed false positives. Gitleaks automatically picks up a
+# `.gitleaks.toml` in the scanned repo — no workflow change needed.
+#
+# Rule: every allowlist entry gets a comment saying WHY and WHO approved it.
+
+title = "Devora gitleaks config"
+
+[extend]
+# Keep all of gitleaks' default rules — we only ADD allowlist entries.
+useDefault = true
+
+[allowlist]
+description = "Devora-approved false positives"
+
+# --- paths (regex) ----------------------------------------------------------
+paths = [
+  # '''fixtures/fake_keys\.dart''',   # example: test fixtures with fake keys (approved: Ali, 2026-07)
+]
+
+# --- specific fake/test values (regex) --------------------------------------
+regexes = [
+  # '''sk_test_[a-zA-Z0-9]+''',       # example: payment gateway TEST keys only (never allow sk_live)
+]

@@ -1,0 +1,575 @@
+# ============================================================================
+# Devora Security Scan — reusable workflow
+#
+# Called from any project repo (mobile / backend / frontend) with ~15 lines.
+# Auto-detects the stack, runs every relevant scanner, and posts one
+# "Security gate" verdict with a summary table on the PR.
+#
+# Do not edit project repos to change scanning behaviour — edit this file
+# once and every project picks it up on its next run.
+#
+# SUPPLY-CHAIN POLICY: every third-party action is pinned to a full commit SHA
+# (tags are mutable — see the tj-actions/changed-files compromise). Renovate
+# keeps the SHA pins updated. The gitleaks binary is version-pinned AND
+# checksum-verified; bump it manually on patch day (version + checksum together).
+# ============================================================================
+name: Devora Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      enforce:
+        description: "Fail the gate when blocking findings exist. Set false during rollout on an existing project, then flip to true."
+        type: boolean
+        required: false
+        default: true
+      severity:
+        description: "Comma-separated Trivy severities that count as blocking."
+        type: string
+        required: false
+        default: "CRITICAL,HIGH"
+      strict_flutter_analyze:
+        description: "Treat flutter analyze issues as blocking (default: informational only)."
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  # --------------------------------------------------------------- detect --
+  detect:
+    name: Detect stack
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      flutter: ${{ steps.probe.outputs.flutter }}
+      flutter_dir: ${{ steps.probe.outputs.flutter_dir }}
+      node: ${{ steps.probe.outputs.node }}
+      php: ${{ steps.probe.outputs.php }}
+      docker: ${{ steps.probe.outputs.docker }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Probe for stack markers
+        id: probe
+        shell: bash
+        run: |
+          flutter=false; flutter_dir="."; node=false; php=false; docker=false
+          if [ -f pubspec.yaml ]; then
+            flutter=true
+          else
+            hit=$(find . -maxdepth 2 -name pubspec.yaml -not -path '*/.*' -not -path '*/build/*' | head -n 1)
+            if [ -n "$hit" ]; then
+              flutter=true
+              flutter_dir=$(dirname "$hit")
+            fi
+          fi
+          [ -f package.json ] && node=true
+          [ -f composer.json ] && php=true
+          if [ -n "$(find . -maxdepth 3 \( -name 'Dockerfile*' -o -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' \) -not -path '*/.*' | head -n 1)" ]; then
+            docker=true
+          fi
+          {
+            echo "flutter=$flutter"
+            echo "flutter_dir=$flutter_dir"
+            echo "node=$node"
+            echo "php=$php"
+            echo "docker=$docker"
+          } >> "$GITHUB_OUTPUT"
+          echo "Detected: flutter=$flutter (dir: $flutter_dir), node=$node, php=$php, docker=$docker"
+
+  # -------------------------------------------------------------- secrets --
+  secrets:
+    name: Secrets (gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0  # full history — leaked-then-deleted secrets still count
+
+      - name: Install gitleaks (pinned + checksum-verified)
+        shell: bash
+        env:
+          # Manual bump on monthly patch day: update BOTH values together.
+          # Checksum source: gitleaks_<ver>_checksums.txt on the GitHub release.
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tgz
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Scan working tree + git history
+        id: scan
+        shell: bash
+        run: |
+          set +e
+          gitleaks git . --redact --exit-code 42 \
+            --report-format json --report-path gitleaks-report.json
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Write gate status
+        shell: bash
+        env:
+          RC: ${{ steps.scan.outputs.rc }}
+        run: |
+          mkdir -p secscan
+          python3 - << 'PY'
+          import json, os, shutil
+          rc = os.environ.get("RC", "1")
+          count = 0
+          note = "secrets in working tree or git history"
+          if os.path.exists("gitleaks-report.json"):
+              try:
+                  count = len(json.load(open("gitleaks-report.json")))
+                  shutil.copy("gitleaks-report.json", "secscan/")
+              except (OSError, ValueError):
+                  pass
+          if rc not in ("0", "42"):
+              note = "gitleaks tool error (rc=" + rc + ") - treated as blocking"
+              count = max(count, 1)
+          json.dump({"name": "Gitleaks (secrets)", "blocking": count, "info": 0, "note": note},
+                    open("secscan/status-gitleaks.json", "w"), indent=2)
+          print("gitleaks blocking findings:", count)
+          PY
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: secscan-gitleaks
+          path: secscan/
+
+  # ----------------------------------------------------------------- sast --
+  sast:
+    name: SAST (semgrep)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: semgrep/semgrep:1.167.0@sha256:06938c1f365d3f67b8cedd8bc117607ae64253f88a0e768e9da9408548927dd6
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Run semgrep
+        id: scan
+        shell: bash
+        run: |
+          set +e
+          semgrep scan --config p/security-audit --config p/secrets \
+            --metrics=off --json --output semgrep.json
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Write gate status
+        shell: bash
+        env:
+          RC: ${{ steps.scan.outputs.rc }}
+        run: |
+          mkdir -p secscan
+          python3 - << 'PY'
+          import json, os, shutil
+          rc = os.environ.get("RC", "1")
+          blocking = 0
+          info = 0
+          note = "static analysis (rulesets: p/security-audit, p/secrets)"
+          if os.path.exists("semgrep.json"):
+              try:
+                  data = json.load(open("semgrep.json"))
+                  for r in data.get("results", []):
+                      sev = r.get("extra", {}).get("severity", "").upper()
+                      if sev == "ERROR":
+                          blocking += 1
+                      else:
+                          info += 1
+                  shutil.copy("semgrep.json", "secscan/")
+              except (OSError, ValueError):
+                  note = "semgrep report unreadable - treated as blocking"
+                  blocking = max(blocking, 1)
+          else:
+              note = "semgrep produced no report (rc=" + rc + ") - treated as blocking"
+              blocking = 1
+          json.dump({"name": "Semgrep (SAST)", "blocking": blocking, "info": info, "note": note},
+                    open("secscan/status-semgrep.json", "w"), indent=2)
+          print("semgrep:", blocking, "blocking /", info, "info")
+          PY
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: secscan-semgrep
+          path: secscan/
+
+  # ----------------------------------------------------------------- deps --
+  deps:
+    name: Dependency CVEs (trivy)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          format: json
+          output: trivy-deps.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: "0"
+
+      - name: Write gate status
+        shell: bash
+        env:
+          BLOCKING_SEVERITIES: ${{ inputs.severity }}
+        run: |
+          mkdir -p secscan
+          python3 - << 'PY'
+          import json, os, shutil
+          blocking_set = {s.strip().upper() for s in os.environ.get("BLOCKING_SEVERITIES", "CRITICAL,HIGH").split(",") if s.strip()}
+          blocking = 0
+          info = 0
+          pkgs = set()
+          note = "known CVEs in lockfiles (pub, npm, composer, ...)"
+          if os.path.exists("trivy-deps.json"):
+              try:
+                  data = json.load(open("trivy-deps.json"))
+                  for result in data.get("Results") or []:
+                      for v in result.get("Vulnerabilities") or []:
+                          if v.get("Severity", "").upper() in blocking_set:
+                              blocking += 1
+                              pkgs.add(v.get("PkgName", "?"))
+                          else:
+                              info += 1
+                  shutil.copy("trivy-deps.json", "secscan/")
+                  if pkgs:
+                      sample = ", ".join(sorted(pkgs)[:5])
+                      note = "vulnerable packages: " + sample + (" ..." if len(pkgs) > 5 else "")
+              except (OSError, ValueError):
+                  note = "trivy report unreadable - treated as blocking"
+                  blocking = max(blocking, 1)
+          else:
+              note = "trivy produced no report - treated as blocking"
+              blocking = 1
+          json.dump({"name": "Trivy (dependencies)", "blocking": blocking, "info": info, "note": note},
+                    open("secscan/status-deps.json", "w"), indent=2)
+          print("trivy deps:", blocking, "blocking /", info, "info")
+          PY
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: secscan-deps
+          path: secscan/
+
+  # ------------------------------------------------------------------ iac --
+  iac:
+    name: Docker/IaC config (trivy)
+    needs: detect
+    if: needs.detect.outputs.docker == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Trivy config scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: json
+          output: trivy-config.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: "0"
+
+      - name: Write gate status
+        shell: bash
+        env:
+          BLOCKING_SEVERITIES: ${{ inputs.severity }}
+        run: |
+          mkdir -p secscan
+          python3 - << 'PY'
+          import json, os, shutil
+          blocking_set = {s.strip().upper() for s in os.environ.get("BLOCKING_SEVERITIES", "CRITICAL,HIGH").split(",") if s.strip()}
+          blocking = 0
+          info = 0
+          note = "Dockerfile / compose misconfigurations"
+          if os.path.exists("trivy-config.json"):
+              try:
+                  data = json.load(open("trivy-config.json"))
+                  for result in data.get("Results") or []:
+                      for m in result.get("Misconfigurations") or []:
+                          if m.get("Severity", "").upper() in blocking_set:
+                              blocking += 1
+                          else:
+                              info += 1
+                  shutil.copy("trivy-config.json", "secscan/")
+              except (OSError, ValueError):
+                  note = "trivy config report unreadable - treated as blocking"
+                  blocking = max(blocking, 1)
+          else:
+              note = "trivy produced no config report - treated as blocking"
+              blocking = 1
+          json.dump({"name": "Trivy (Docker/IaC)", "blocking": blocking, "info": info, "note": note},
+                    open("secscan/status-iac.json", "w"), indent=2)
+          print("trivy config:", blocking, "blocking /", info, "info")
+          PY
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: secscan-iac
+          path: secscan/
+
+  # ------------------------------------------------------ flutter security --
+  flutter_security:
+    name: Flutter (analyze + OWASP + mobsfscan)
+    needs: detect
+    if: needs.detect.outputs.flutter == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          cache: true
+
+      - name: flutter pub get
+        shell: bash
+        working-directory: ${{ needs.detect.outputs.flutter_dir }}
+        run: flutter pub get
+
+      - name: flutter analyze
+        id: analyze
+        shell: bash
+        working-directory: ${{ needs.detect.outputs.flutter_dir }}
+        run: |
+          set +e
+          flutter analyze --no-pub 2>&1 | tee flutter-analyze.txt
+          rc=${PIPESTATUS[0]}
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: OWASP Mobile scanners (M1/M2/M5/M9)
+        uses: devora2025/devora-security-ci/actions/owasp-flutter@main
+        with:
+          project-path: ${{ needs.detect.outputs.flutter_dir }}
+          output-dir: secscan
+
+      - name: mobsfscan
+        id: mobsf
+        shell: bash
+        env:
+          # via env, not inline ${{ }} — the dir name comes from PR contents
+          FLUTTER_DIR: ${{ needs.detect.outputs.flutter_dir }}
+        run: |
+          set +e
+          pip3 install --quiet mobsfscan --break-system-packages 2>/dev/null || pip3 install --quiet mobsfscan
+          mobsfscan --json -o mobsfscan.json "$FLUTTER_DIR"
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Write gate status (analyze + mobsfscan)
+        shell: bash
+        env:
+          ANALYZE_RC: ${{ steps.analyze.outputs.rc }}
+          STRICT_ANALYZE: ${{ inputs.strict_flutter_analyze }}
+          FLUTTER_DIR: ${{ needs.detect.outputs.flutter_dir }}
+        run: |
+          mkdir -p secscan
+          python3 - << 'PY'
+          import json, os, re, shutil
+
+          # ---- flutter analyze -------------------------------------------
+          rc = os.environ.get("ANALYZE_RC", "1")
+          strict = os.environ.get("STRICT_ANALYZE", "false").lower() == "true"
+          fdir = os.environ.get("FLUTTER_DIR", ".")
+          issues = 0
+          note = "clean"
+          path = os.path.join(fdir, "flutter-analyze.txt")
+          if os.path.exists(path):
+              text = open(path, errors="replace").read()
+              m = re.search(r"(\d+)\s+issues?\s+found", text)
+              if m:
+                  issues = int(m.group(1))
+              elif rc != "0":
+                  issues = 1
+              shutil.copy(path, "secscan/")
+              if issues:
+                  note = str(issues) + " analyzer issue(s) - see flutter-analyze.txt"
+          else:
+              issues = 1 if rc != "0" else 0
+              note = "no analyzer output captured"
+          status = {
+              "name": "flutter analyze",
+              "blocking": issues if strict else 0,
+              "info": 0 if strict else issues,
+              "note": note + ("" if strict else " (informational; strict_flutter_analyze=false)"),
+          }
+          json.dump(status, open("secscan/status-analyze.json", "w"), indent=2)
+
+          # ---- mobsfscan ---------------------------------------------------
+          blocking = 0
+          info = 0
+          note = "mobile SAST (MobSF rules)"
+          if os.path.exists("mobsfscan.json"):
+              try:
+                  data = json.load(open("mobsfscan.json"))
+                  for rule, hit in (data.get("results") or {}).items():
+                      sev = (hit.get("metadata") or {}).get("severity", "").upper()
+                      if sev == "ERROR":
+                          blocking += 1
+                      else:
+                          info += 1
+                  shutil.copy("mobsfscan.json", "secscan/")
+              except (OSError, ValueError):
+                  note = "mobsfscan report unreadable - treated as blocking"
+                  blocking = max(blocking, 1)
+          else:
+              note = "mobsfscan produced no report - treated as blocking"
+              blocking = 1
+          json.dump({"name": "mobsfscan (mobile SAST)", "blocking": blocking, "info": info, "note": note},
+                    open("secscan/status-mobsfscan.json", "w"), indent=2)
+          print("analyze issues:", issues, "| mobsfscan:", blocking, "blocking /", info, "info")
+          PY
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: secscan-flutter
+          path: secscan/
+
+  # ----------------------------------------------------------------- gate --
+  gate:
+    name: Security gate
+    needs: [detect, secrets, sast, deps, iac, flutter_security]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          pattern: secscan-*
+          merge-multiple: true
+          path: secscan
+
+      - name: Aggregate results
+        id: agg
+        shell: bash
+        env:
+          ENFORCE: ${{ inputs.enforce }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          STACK_LINE: "flutter=${{ needs.detect.outputs.flutter }} · node=${{ needs.detect.outputs.node }} · php=${{ needs.detect.outputs.php }} · docker=${{ needs.detect.outputs.docker }}"
+        run: |
+          python3 - << 'PY'
+          import glob, json, os
+
+          enforce = os.environ.get("ENFORCE", "true").lower() == "true"
+          stack = os.environ.get("STACK_LINE", "")
+          needs = json.loads(os.environ.get("NEEDS_JSON", "{}"))
+
+          rows = []
+          for path in sorted(glob.glob("secscan/status-*.json")):
+              try:
+                  rows.append(json.load(open(path)))
+              except (OSError, ValueError):
+                  rows.append({"name": os.path.basename(path), "blocking": 1, "info": 0,
+                               "note": "status file unreadable - treated as blocking"})
+
+          # A scan job that failed or was cancelled without leaving a status
+          # file still has to block the gate - silence must never equal pass.
+          expected = {
+              "secrets": ["status-gitleaks.json"],
+              "sast": ["status-semgrep.json"],
+              "deps": ["status-deps.json"],
+              "iac": ["status-iac.json"],
+              "flutter_security": ["status-analyze.json", "status-owasp.json", "status-mobsfscan.json"],
+          }
+          have = {os.path.basename(p) for p in glob.glob("secscan/status-*.json")}
+          for job, files in expected.items():
+              result = (needs.get(job) or {}).get("result", "skipped")
+              if result in ("failure", "cancelled") and not any(f in have for f in files):
+                  rows.append({"name": "job: " + job, "blocking": 1, "info": 0,
+                               "note": "job " + result + " before producing results - treated as blocking"})
+
+          total_blocking = sum(r.get("blocking", 0) for r in rows)
+          total_info = sum(r.get("info", 0) for r in rows)
+
+          verdict = "PASS" if total_blocking == 0 else ("FAIL" if enforce else "WARN (enforce=false)")
+          icon = {"PASS": "✅", "FAIL": "❌"}.get(verdict, "⚠️")
+
+          lines = []
+          lines.append("<!-- devora-security-gate -->")
+          lines.append("## " + icon + " Devora Security Gate — " + verdict)
+          lines.append("")
+          lines.append("Stack detected: " + stack)
+          lines.append("")
+          lines.append("| Scanner | Blocking | Info | Notes |")
+          lines.append("|---|---:|---:|---|")
+          for r in rows:
+              lines.append("| " + str(r.get("name", "?")) + " | " + str(r.get("blocking", 0)) + " | "
+                           + str(r.get("info", 0)) + " | " + str(r.get("note", "")).replace("|", "/") + " |")
+          lines.append("")
+          lines.append("**Total: " + str(total_blocking) + " blocking · " + str(total_info) + " informational**")
+          lines.append("")
+          if total_blocking:
+              lines.append("Raw reports are attached as workflow artifacts (`secscan-*`). "
+                           "Triage guide: see `docs/TRIAGE.md` in the security-ci repo.")
+          body = "\n".join(lines)
+
+          open("comment.md", "w").write(body)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write(body + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write("blocking=" + str(total_blocking) + "\n")
+          print(body)
+          PY
+
+      - name: Post / update PR comment
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('comment.md', 'utf8');
+            const marker = '<!-- devora-security-gate -->';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const prev = comments.find(c => c.body && c.body.includes(marker));
+            if (prev) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: prev.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Enforce gate
+        shell: bash
+        env:
+          ENFORCE: ${{ inputs.enforce }}
+          BLOCKING: ${{ steps.agg.outputs.blocking }}
+        run: |
+          if [ "$BLOCKING" != "0" ] && [ "$ENFORCE" = "true" ]; then
+            echo "::error::Security gate FAILED - $BLOCKING blocking finding(s). See the job summary or PR comment."
+            exit 1
+          fi
+          if [ "$BLOCKING" != "0" ]; then
+            echo "::warning::enforce=false - $BLOCKING blocking finding(s) reported but not failing the build."
+          fi
+          echo "Security gate: done."
